@@ -1,0 +1,124 @@
+::
+  ZIP: xxxx
+  Title: BlazeSync for zcash light clients.
+  Owner: Aditya Kulkarni <aditya@zecwallet.co>
+  Status: Draft
+  Category: Light Clients
+  Created: 2021-04-26
+  License: MIT
+  Discussions-To: <>
+
+
+Terminology
+===========
+
+The key words "MUST", "MUST NOT", "SHOULD", and "SHOULD NOT" in this document
+are to be interpreted as described in RFC 2119. [#RFC2119]_
+
+
+Abstract
+========
+
+The sync process for Lightclients today is not optimal. Lightclients today process `CompactBlock`s
+`CompactOutput`s and `CompactSpend`s one at a time which causes performance bottlenecks. BlazeSync
+attempts to solve this by decoupling the various parts of the sync process to allow many things
+to be parallelized, allowing the overall sync to move faster. 
+
+
+Motivation and Requirements
+===========================
+
+The main goals of BlazeSync are:
+
+* Allow faster acces to more recently recieved sapling notes. Both detecting incoming
+  notes and allowing them to be spent should be faster, and now wait for the whole 
+  sync to finish
+
+* Decouple the updating of witnesses for sapling notes with the trial decryptions. 
+
+* Allow  multiple trial decryptions to be done parallely on multiple cores.
+
+* Decouple fetching data over the network from the trial decrption and witness updating.
+
+
+Specification
+=============
+
+This sections describes the data structures and algorithms used in the sync. 
+
+Wallet Transaction List (WTL)
+------------------------------
+The Wallet Transaction List (WTL) data structure is data structure that holds the list of all transactions belonging to the wallet. It is represented in memory by the `WalletTransaction` struct (and it's dependent structs). It may be persisted to disk as well, either into flat files or into a SQLLite or similar data base. 
+
+This data structure and its components can be incomplete when first created, because the transactions are scanned out of order and backwards. The code needs to be resilient enough to tolerate some data that is temporarily missing in the data structure and will be filled in later as the scan proceeds. 
+
+`WalletTransaction` are keyed by `TxID` of the transaction, and needs be indexable/lookup-able by `TxID`. We also will index the sapling nullifiers - i.e., we need to be able to lookup the `TxID` where a nullifier was created (created, not spent).
+
+BlazeSync starts by syncing the latest block first and moving backwards. Blocks are requested from LightwalletD in 1000-block chunks, streamed in descending order of block height.  
+
+(FEATURE REQUEST: Allow blocks to be streamed in descending order of height in `GetBlockRange`)
+
+For each block received from LightwalletD, we do the trial decryptions for all Spends and Outputs, over all the wallet's IVKs and OVKs. If it detects a Spend or Output, it adds the transaction into the Wallet Transaction List (WTL). During a sync, the Spend for a sapling note is likely to be encountered before the Output, so when inserting the data into the Wallet Transaction List(WTL), some data might be missing or partial.
+
+Trial decryptions are done in parallel, and might be decrypted out-of-order. i.e., the transactions might not be inserted strictly by block height, and that's OK. The WTL is built to handle this.
+
+Detecting Sapling Spends
+------------------------
+
+A sapling spend is detected when either 
+1. The `CompactSpend.nullifier` matches a nullifier in that we already have in the wallet OR
+2. The `try_sapling_output_recovery` matches a `SaplingOutput` in the transaction when scanned with one of the wallet's OVKs. 
+
+(FEATURE REQUEST1: `librustzcash` might be missing a `try_sapling_compact_output_recovery` method. Attempt decryption of a `CompactOutput` with an OVK.)
+
+It might be possible that the wallet doesn't actually have one of the nullifiers in such a transaction, for example, if a previous wallet had an imported private key, and the nullifier belonged to that. 
+The wallet should assume that all the nullifiers in this transaction belong to the wallet and have been spent here. 
+
+
+Detecting Sapling Outputs
+--------------------------
+
+A sapling output is detected when the `try_sapling_compact_note_decryption` succeeds on a CompactOutput. In this case, the note is marked as received.
+The wallet might need to ask the LightwalletD for the sapling `CommitmentTree` to initialize this note's nullifier and start tracking the witness if the wallet doesn't already have it. In this case, the note should be marked "untrusted". It will flip to "trusted" when the `WalletBlock`'s `CommitmentTree` catches up to the block in which this note was received, and the tree received from LightwalletD is compared to the computed one, and then marked as trusted. Only trusted notes can be spent. 
+
+### Maintaining Note's witnesses
+When a new note is created during the sync, it's witness is fetched from LightwalletD, and marked untrusted. At this point, all the information needed to track the updates to the witness is available in the wallet, and the note's witness can start being updated, even though the sync is not complete yet. This allows the note to be ready to be spent sooner, especially benefiting recently received notes. 
+
+For notes that are already in the wallet, the witness can start to be updated once all the blocks are received from LightwalletD.
+
+Note that when a nullifier has been spent, we don't need to maintain it's witness anymore, but we still keep it around for at least 100 more blocks, in case of a reorg. 
+
+Detecting transparent spend(s) and receive(s)
+----------------------------------------------
+
+Detecting transparent transactions can be done in parallel, as they don't really depend on the order of blocks. In fact, LightwalletD supports range queries for all Utxo/transparent APIs, so we can get a list of all transparent transactions for all the blocks in one step and process them. 
+
+Wallet Blocks
+--------------
+The wallet blocks data structure holds a list of the blocks that are relevant to the wallet. The Wallet Blocks are updated in two passes. 
+
+Phase 1: As the blocks are received in reverse order from LightwalletD, the block number and block hash are stored. 
+When the sync reaches the wallet's previous `latest_synced_block` (or a checkpoint for a new wallet), the block's `CommitmentTree` is computed and stored alongside the hash and the height. 
+Once all the blocks are downloaded, all the unspent nullifiers' witnesses' can start to be updated. 
+
+Phase 2: The `CommitmentTree` for each block is computed forward direction, until it reaches the latest block
+As the forwards sync reaches an active and untrusted Sapling note (i.e., a Sapling note in the wallet that has not been spent and has not been marked trusted), the CommitmentTree that was computed is compared to what was fetched for the Sapling note. The trees should match, upon which the Note is marked as trusted, and ready to be spent. 
+
+Fetching Memos
+---------------
+The memo for a Sapling Note can be fetched as soon as we detect it was received. The same also applies to recovering memos for outgoing transactions. Therefore, as and when spends and outputs are detected, we can fetch the full transaction from LightwalletD in order to attempt recovering memos (If the user has enabled this)
+
+Detecting Reorgs
+-----------------
+As the sync proceeds backwards, it will eventually hit the wallet's `last_synced_height`. If the height and hash of the block matches, then there is no reorg. If it doesn't, the wallet's block at `last_synced_height` was reorged, and needs to be "popped". 
+
+'Popping' Blocks
+-----------------
+When a block has been reorg'd, we need to undo all the effects of adding the block into the wallet. This means:
+1. Popping the last witness update to each of the wallet's active note's witness
+2. Removing all `txid` from Wallet Transaction List (WTL) that were created at the height
+3. Remove all spends for notes & Utxo's that were popped in step 2 from all other transactions
+4. If a transaction that was popped in step 2 was a spend transaction who's anchor was a the block, we need to notify the user that one of the recent transactions that she sent will no longer be mined. 
+5. Remove the block at the height from the `WalletBlocks` data structure. 
+
+Note that there is a 100-block reorg limit. 
