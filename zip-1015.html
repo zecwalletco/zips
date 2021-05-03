@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ZIP 1015: BlazeSync for zcash light clients.</title>
+    <meta charset="utf-8" />
+</head>
+<body>
+    <section>
+        <pre>ZIP: xxxx
+Title: BlazeSync for zcash light clients.
+Owner: Aditya Kulkarni &lt;aditya@zecwallet.co&gt;
+Status: Draft
+Category: Light Clients
+Created: 2021-04-26
+License: MIT</pre>
+        <section id="terminology">
+            <h2>Terminology</h2>
+            <p>The key words "MUST", "MUST NOT", "SHOULD", and "SHOULD NOT" in this document are to be interpreted as described in RFC 2119. <a id="id1" class="footnote_reference" href="#rfc2119">1</a></p>
+        </section>
+        <section id="abstract">
+            <h2>Abstract</h2>
+            <p>The sync process for Lightclients today is not optimal. Lightclients today process <code>CompactBlock</code>s, <code>CompactOutput</code>s and <code>CompactSpend</code>s one at a time which causes performance bottlenecks. BlazeSync attempts to solve this by decoupling the various parts of the sync process to allow many things to be parallelized, allowing the overall sync to move faster.</p>
+        </section>
+        <section id="motivation-and-requirements">
+            <h2>Motivation and Requirements</h2>
+            <p>The main goals of BlazeSync are:</p>
+            <ul>
+                <li>Allow faster acces to more recently recieved sapling notes. Both detecting incoming notes and allowing them to be spent should be faster, and now wait for the whole sync to finish</li>
+                <li>Decouple the updating of witnesses for sapling notes with the trial decryptions.</li>
+                <li>Allow multiple trial decryptions to be done parallely on multiple cores.</li>
+                <li>Decouple fetching data over the network from the trial decrption and witness updating.</li>
+            </ul>
+        </section>
+        <section id="specification">
+            <h2>Specification</h2>
+            <p>This sections describes the data structures and algorithms used in the sync.</p>
+            <section id="wallet-transaction-list-wtl">
+                <h3>Wallet Transaction List (WTL)</h3>
+                <p>The Wallet Transaction List (WTL) data structure is data structure that holds the list of all transactions belonging to the wallet. It is represented in memory by the <code>WalletTransaction</code> struct (and it's dependent structs). It may be persisted to disk as well, either into flat files or into a SQLLite or similar data base.</p>
+                <p>This data structure and its components can be incomplete when first created, because the transactions are scanned out of order and backwards. The code needs to be resilient enough to tolerate some data that is temporarily missing in the data structure and will be filled in later as the scan proceeds.</p>
+                <p><code>WalletTransaction</code> are keyed by <code>TxID</code> of the transaction, and needs be indexable/lookup-able by <code>TxID</code>. We also will index the sapling nullifiers - i.e., we need to be able to lookup the <code>TxID</code> where a nullifier was created (created, not spent).</p>
+                <p>BlazeSync starts by syncing the latest block first and moving backwards. Blocks are requested from LightwalletD in 1000-block chunks, streamed in descending order of block height.</p>
+                <p>(FEATURE REQUEST: Allow blocks to be streamed in descending order of height in <code>GetBlockRange</code>)</p>
+                <p>For each block received from LightwalletD, we do the trial decryptions for all Spends and Outputs, over all the wallet's IVKs and OVKs. If it detects a Spend or Output, it adds the transaction into the Wallet Transaction List (WTL). During a sync, the Spend for a sapling note is likely to be encountered before the Output, so when inserting the data into the Wallet Transaction List(WTL), some data might be missing or partial.</p>
+                <p>Trial decryptions are done in parallel, and might be decrypted out-of-order. i.e., the transactions might not be inserted strictly by block height, and that's OK. The WTL is built to handle this.</p>
+            </section>
+            <section id="detecting-sapling-spends">
+                <h3>Detecting Sapling Spends</h3>
+                <p>A sapling spend is detected when either 1. The <code>CompactSpend.nullifier</code> matches a nullifier in that we already have in the wallet OR 2. The <code>try_sapling_output_recovery</code> matches a <code>SaplingOutput</code> in the transaction when scanned with one of the wallet's OVKs.</p>
+                <p>(FEATURE REQUEST1: <code>librustzcash</code> might be missing a <code>try_sapling_compact_output_recovery</code> method. Attempt decryption of a <code>CompactOutput</code> with an OVK.)</p>
+                <p>It might be possible that the wallet doesn't actually have one of the nullifiers in such a transaction, for example, if a previous wallet had an imported private key, and the nullifier belonged to that. The wallet should assume that all the nullifiers in this transaction belong to the wallet and have been spent here.</p>
+            </section>
+            <section id="detecting-sapling-outputs">
+                <h3>Detecting Sapling Outputs</h3>
+                <p>A sapling output is detected when the <code>try_sapling_compact_note_decryption</code> succeeds on a CompactOutput. In this case, the note is marked as received. The wallet might need to ask the LightwalletD for the sapling <code>CommitmentTree</code> to initialize this note's nullifier and start tracking the witness if the wallet doesn't already have it. In this case, the note should be marked "untrusted". It will flip to "trusted" when the <code>WalletBlock</code>'s <code>CommitmentTree</code> catches up to the block in which this note was received, and the tree received from LightwalletD is compared to the computed one, and then marked as trusted. Only trusted notes can be spent.</p>
+                <p>### Maintaining Note's witnesses When a new note is created during the sync, it's witness is fetched from LightwalletD, and marked untrusted. At this point, all the information needed to track the updates to the witness is available in the wallet, and the note's witness can start being updated, even though the sync is not complete yet. This allows the note to be ready to be spent sooner, especially benefiting recently received notes.</p>
+                <p>For notes that are already in the wallet, the witness can start to be updated once all the blocks are received from LightwalletD.</p>
+                <p>Note that when a nullifier has been spent, we don't need to maintain it's witness anymore, but we still keep it around for at least 100 more blocks, in case of a reorg.</p>
+            </section>
+            <section id="detecting-transparent-spend-s-and-receive-s">
+                <h3>Detecting transparent spend(s) and receive(s)</h3>
+                <p>Detecting transparent transactions can be done in parallel, as they don't really depend on the order of blocks. In fact, LightwalletD supports range queries for all Utxo/transparent APIs, so we can get a list of all transparent transactions for all the blocks in one step and process them.</p>
+            </section>
+            <section id="wallet-blocks">
+                <h3>Wallet Blocks</h3>
+                <p>The wallet blocks data structure holds a list of the blocks that are relevant to the wallet. The Wallet Blocks are updated in two passes.</p>
+                <p>Phase 1: As the blocks are received in reverse order from LightwalletD, the block number and block hash are stored. When the sync reaches the wallet's previous <code>latest_synced_block</code> (or a checkpoint for a new wallet), the block's <code>CommitmentTree</code> is computed and stored alongside the hash and the height. Once all the blocks are downloaded, all the unspent nullifiers' witnesses' can start to be updated.</p>
+                <p>Phase 2: The <code>CommitmentTree</code> for each block is computed forward direction, until it reaches the latest block As the forwards sync reaches an active and untrusted Sapling note (i.e., a Sapling note in the wallet that has not been spent and has not been marked trusted), the CommitmentTree that was computed is compared to what was fetched for the Sapling note. The trees should match, upon which the Note is marked as trusted, and ready to be spent.</p>
+            </section>
+            <section id="fetching-memos">
+                <h3>Fetching Memos</h3>
+                <p>The memo for a Sapling Note can be fetched as soon as we detect it was received. The same also applies to recovering memos for outgoing transactions. Therefore, as and when spends and outputs are detected, we can fetch the full transaction from LightwalletD in order to attempt recovering memos (If the user has enabled this)</p>
+            </section>
+            <section id="detecting-reorgs">
+                <h3>Detecting Reorgs</h3>
+                <p>As the sync proceeds backwards, it will eventually hit the wallet's <code>last_synced_height</code>. If the height and hash of the block matches, then there is no reorg. If it doesn't, the wallet's block at <code>last_synced_height</code> was reorged, and needs to be "popped".</p>
+            </section>
+            <section id="popping-blocks">
+                <h3>'Popping' Blocks</h3>
+                <p>When a block has been reorg'd, we need to undo all the effects of adding the block into the wallet. This means: 1. Popping the last witness update to each of the wallet's active note's witness 2. Removing all <code>txid</code> from Wallet Transaction List (WTL) that were created at the height 3. Remove all spends for notes &amp; Utxo's that were popped in step 2 from all other transactions 4. If a transaction that was popped in step 2 was a spend transaction who's anchor was a the block, we need to notify the user that one of the recent transactions that she sent will no longer be mined. 5. Remove the block at the height from the <code>WalletBlocks</code> data structure.</p>
+                <p>Note that there is a 100-block reorg limit.</p>
+            </section>
+        </section>
+        <section id="data-structures">
+            <h2>Data structures</h2>
+            <pre data-language="rust"><span class="k">use</span><span class="w"> </span><span class="n">zcash_primitives</span>::<span class="p">{</span><span class="n">memo</span>::<span class="n">Memo</span><span class="p">,</span><span class="w"> </span><span class="n">merkle_tree</span>::<span class="p">{</span><span class="n">CommitmentTree</span><span class="p">,</span><span class="w"> </span><span class="n">IncrementalWitness</span><span class="p">},</span><span class="w"> </span><span class="n">sapling</span>::<span class="p">{</span><span class="n">Node</span><span class="p">,</span><span class="w"> </span><span class="n">Note</span><span class="p">}};</span><span class="w"></span>
+
+
+<span class="c1">// Represents a single transaction that belongs to the wallet. This data structure can be held in memory</span>
+<span class="c1">// and persisted to disk, even into a SQL database. BlazeSync relies on being able to lookup `WalletTransaction` by</span>
+<span class="c1">// a TxID, SQL schemas should also index by it. (Or hold it in memory as a map)</span>
+<span class="k">struct</span> <span class="nc">WalletTransaction</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="c1">// The TxID of this transaction.</span>
+<span class="w">    </span><span class="n">txid</span>: <span class="p">[</span><span class="kt">u8</span><span class="p">;</span><span class="w"> </span><span class="mi">32</span><span class="p">],</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// The block number and hash where this TxID was mined. This will be `None` if this Tx has not been mined yet.</span>
+<span class="w">    </span><span class="n">block</span>: <span class="nb">Option</span><span class="o">&lt;</span><span class="n">BlockID</span><span class="o">&gt;</span><span class="p">,</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// List of transparent UTXOs that were spent in this Transaction. Note that this is a list</span>
+<span class="w">    </span><span class="c1">// of UtxoIDs, not the UTXOs themselves, since the wallet is likely to encounter spends before the receives (See</span>
+<span class="w">    </span><span class="c1">// Note below))</span>
+<span class="w">    </span><span class="n">spent_utxos</span>: <span class="nb">Vec</span><span class="o">&lt;</span><span class="n">UtxoID</span><span class="o">&gt;</span><span class="p">,</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// List of UTXOs that were received in this transaction. The whole Utxo (not just the ID) is stored here. We</span>
+<span class="w">    </span><span class="c1">// also need to be able to index into this.</span>
+<span class="w">    </span><span class="n">received_utxos</span>: <span class="nb">Vec</span><span class="o">&lt;</span><span class="n">Utxo</span><span class="o">&gt;</span><span class="p">,</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// List of Sapling nullifiers spent in this Transaction. All sapling notes are indexed by their nullifiers</span>
+<span class="w">    </span><span class="c1">// (similar to `UtxoID` or `BlockID`)</span>
+<span class="w">    </span><span class="n">spent_sapling_notes</span>: <span class="nb">Vec</span><span class="o">&lt;</span><span class="n">SaplingNoteID</span><span class="o">&gt;</span><span class="p">,</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// List of outgoing sapling sends contained in this transaction.</span>
+<span class="w">    </span><span class="n">outgoing_metadata</span>: <span class="nb">Vec</span><span class="o">&lt;</span><span class="n">OutgoingMetadata</span><span class="o">&gt;</span><span class="p">,</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// List of sapling notes received in this Transaction. We store the whole Sapling note here.</span>
+<span class="w">    </span><span class="n">received_sapling_notes</span>: <span class="nb">Vec</span><span class="o">&lt;</span><span class="n">SaplingNote</span><span class="o">&gt;</span><span class="p">,</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// A quick note on the use of `UtxoID` and nullifiers to identify transparent Utxos and sapling notes:</span>
+<span class="w">    </span><span class="c1">// Since the wallet scans backwards, we are likely to see the spending of a Utxo or a sapling note first, and then</span>
+<span class="w">    </span><span class="c1">// eventually reach the Transaction where the Utxos and Sapling notes were created. That is, while a scan</span>
+<span class="w">    </span><span class="c1">// is in progress, the data might not be fully available yet, so we use IDs rather than Rust pointers everywhere.</span>
+<span class="w">    </span><span class="c1">// Of course, this means that the code needs to be careful to make sure everything lines up once the sync is</span>
+<span class="w">    </span><span class="c1">// complete - i.e., All `UtxoID`, `BlockID` and nullifiers are valid.</span>
+<span class="p">}</span><span class="w"></span>
+
+<span class="c1">// A struct that is useful to lookup Sapling notes. Mainly used to keep track of</span>
+<span class="c1">// spent sapling notes, which are usually seen before the receive, so we may, at times,</span>
+<span class="c1">// have partial information</span>
+<span class="k">struct</span> <span class="nc">SaplingNoteID</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="c1">// The nullifier, if available</span>
+<span class="w">    </span><span class="n">nullifier</span>: <span class="nb">Option</span><span class="o">&lt;</span><span class="p">[</span><span class="kt">u8</span><span class="p">;</span><span class="w"> </span><span class="mi">32</span><span class="p">]</span><span class="o">&gt;</span><span class="p">,</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// The value that was spent, which is the value of the note that was spent.</span>
+<span class="w">    </span><span class="n">value</span>: <span class="kt">u64</span><span class="p">,</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// The TxID in which this Sapling note was created</span>
+<span class="w">    </span><span class="n">created_txid</span>: <span class="nb">Option</span><span class="o">&lt;</span><span class="p">[</span><span class="kt">u8</span><span class="p">;</span><span class="w"> </span><span class="mi">32</span><span class="p">]</span><span class="o">&gt;</span><span class="p">,</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+
+<span class="c1">// Struct representing information recovered from an outgoing sapling transaction, which is</span>
+<span class="c1">// recovered using the OVK. Has metadata about a payment sent to a sapling address.</span>
+<span class="k">struct</span> <span class="nc">OutgoingMetadata</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="c1">// The address to which this TX was sent</span>
+<span class="w">    </span><span class="n">address</span>: <span class="nb">String</span><span class="p">,</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// Amount that was sent</span>
+<span class="w">    </span><span class="n">value</span>: <span class="kt">u64</span><span class="p">,</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// Memo that we sent to the address</span>
+<span class="w">    </span><span class="n">memo</span>: <span class="nb">Option</span><span class="o">&lt;</span><span class="n">Memo</span><span class="o">&gt;</span><span class="p">,</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+
+<span class="c1">// The details of a sapling note that belongs to the wallet.</span>
+<span class="k">struct</span> <span class="nc">SaplingNote</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="c1">// The nullifier of this note.</span>
+<span class="w">    </span><span class="n">nullifier</span>: <span class="p">[</span><span class="kt">u8</span><span class="p">;</span><span class="w"> </span><span class="mi">32</span><span class="p">],</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// The details of the note (value, rseed, g_d, pk_d)</span>
+<span class="w">    </span><span class="n">note</span>: <span class="nc">Note</span><span class="p">,</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// The memo for this Note. This is optional, because the wallet may not have fetched it yet,</span>
+<span class="w">    </span><span class="c1">// or the user has disabled fetching memos</span>
+<span class="w">    </span><span class="n">memo</span>: <span class="nb">Option</span><span class="o">&lt;</span><span class="n">Memo</span><span class="o">&gt;</span><span class="p">,</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// The wallet z-address that this note belongs to</span>
+<span class="w">    </span><span class="n">wallet_key</span>: <span class="nb">String</span><span class="p">,</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// The witness for this note, used while spending it. Note that this `Vec` might be empty,</span>
+<span class="w">    </span><span class="c1">// if we don&#39;t have the spending key (we only have the viewing key) of this address.</span>
+<span class="w">    </span><span class="n">witness</span>: <span class="nb">Vec</span><span class="o">&lt;</span><span class="n">IncrementalWitness</span><span class="o">&lt;</span><span class="n">Node</span><span class="o">&gt;&gt;</span><span class="p">,</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// The TxID where this Sapling note was _created_</span>
+<span class="w">    </span><span class="n">txid</span>: <span class="p">[</span><span class="kt">u8</span><span class="p">;</span><span class="w"> </span><span class="mi">32</span><span class="p">],</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// The block where this Sapling note was _created_</span>
+<span class="w">    </span><span class="n">block</span>: <span class="nc">BlockID</span><span class="p">,</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// The position where this note was created. That is, the output number of the TxID where this note was</span>
+<span class="w">    </span><span class="c1">// created. We need this because the witness for this note is created at this position. The</span>
+<span class="w">    </span><span class="c1">// `(block id, txid and position)` together identify where to start updating the witness for this note from.</span>
+<span class="w">    </span><span class="n">note_position</span>: <span class="kt">u32</span><span class="p">,</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// The TxID of the transaction where this was spent. Note that this TxID will need to correspond to</span>
+<span class="w">    </span><span class="c1">// a `WalletTransaction`, so we can connect it to where it was spent. A Note that has been spent</span>
+<span class="w">    </span><span class="c1">// doesn&#39;t need to have its `witness` tracked anymore, so the `witness` should become vec![].</span>
+<span class="w">    </span><span class="n">spent_txid</span>: <span class="nb">Option</span><span class="o">&lt;</span><span class="p">[</span><span class="kt">u8</span><span class="p">;</span><span class="w"> </span><span class="mi">32</span><span class="p">]</span><span class="o">&gt;</span><span class="p">,</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// If this note was created automatically by the wallet as &quot;change&quot;. Determining this is a bit of guesswork,</span>
+<span class="w">    </span><span class="c1">// since the protocol doesn&#39;t have a concept of &quot;change&quot;, but useful when displaying transactions</span>
+<span class="w">    </span><span class="c1">// in the wallet.</span>
+<span class="w">    </span><span class="n">is_change</span>: <span class="kt">bool</span><span class="p">,</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+
+<span class="c1">// A simple structure to identify a Utxo in the wallet. It essentially points to a Utxo.</span>
+<span class="k">struct</span> <span class="nc">UtxoID</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="c1">// The TxID where this UTXO was _created_</span>
+<span class="w">    </span><span class="n">txid</span>: <span class="p">[</span><span class="kt">u8</span><span class="p">;</span><span class="w"> </span><span class="mi">32</span><span class="p">],</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// The output_index of this Utxo</span>
+<span class="w">    </span><span class="n">output_index</span>: <span class="kt">u32</span><span class="p">,</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+
+<span class="c1">// A way to identify blocks across the wallet. We store both the height and the hash, making it easier to deal</span>
+<span class="c1">// with rollbacks</span>
+<span class="k">struct</span> <span class="nc">BlockID</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="c1">// Hash of the block</span>
+<span class="w">    </span><span class="n">hash</span>: <span class="p">[</span><span class="kt">u8</span><span class="p">;</span><span class="w"> </span><span class="mi">32</span><span class="p">],</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// Block height</span>
+<span class="w">    </span><span class="n">height</span>: <span class="kt">u32</span><span class="p">,</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// The state of the sapling tree at the end of the block.</span>
+<span class="w">    </span><span class="n">tree</span>: <span class="nc">CommitmentTree</span><span class="o">&lt;</span><span class="n">Node</span><span class="o">&gt;</span><span class="p">,</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span>
+
+<span class="c1">// A simple data structure identifying a UTXO in the wallet.</span>
+<span class="k">struct</span> <span class="nc">Utxo</span><span class="w"> </span><span class="p">{</span><span class="w"></span>
+<span class="w">    </span><span class="c1">// The TxID where this UTXO was _created_</span>
+<span class="w">    </span><span class="n">txid</span>: <span class="p">[</span><span class="kt">u8</span><span class="p">;</span><span class="w"> </span><span class="mi">32</span><span class="p">],</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// The block where this UTXO was _created_</span>
+<span class="w">    </span><span class="n">block</span>: <span class="nc">BlockID</span><span class="p">,</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// The output_index of this Utxo</span>
+<span class="w">    </span><span class="n">output_index</span>: <span class="kt">u32</span><span class="p">,</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// Amount (in zats) held in this UTXO</span>
+<span class="w">    </span><span class="n">value</span>: <span class="kt">u64</span><span class="p">,</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// The TxID of the transaction where this was spent. Note that this TxID will need to correspond to</span>
+<span class="w">    </span><span class="c1">// a `WalletTransaction`, so we can connect it to where it was spent.</span>
+<span class="w">    </span><span class="n">spent_txid</span>: <span class="nb">Option</span><span class="o">&lt;</span><span class="p">[</span><span class="kt">u8</span><span class="p">;</span><span class="w"> </span><span class="mi">32</span><span class="p">]</span><span class="o">&gt;</span><span class="p">,</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// The actual stript of the Utxo</span>
+<span class="w">    </span><span class="n">script</span>: <span class="nb">Vec</span><span class="o">&lt;</span><span class="kt">u8</span><span class="o">&gt;</span><span class="p">,</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// The t-address of this Utxo. Note that this address may not belong to the wallet,</span>
+<span class="w">    </span><span class="c1">// and even if it did, we may not have the private key of this address.</span>
+<span class="w">    </span><span class="n">address</span>: <span class="nb">String</span><span class="p">,</span><span class="w"></span>
+
+<span class="w">    </span><span class="c1">// If this Utxo was created automatically by the wallet as &quot;change&quot;. Determining this is a bit of guesswork,</span>
+<span class="w">    </span><span class="c1">// since the protocol doesn&#39;t have a concept of &quot;change&quot;, but useful when displaying transactions</span>
+<span class="w">    </span><span class="c1">// in the wallet.</span>
+<span class="w">    </span><span class="n">is_change</span>: <span class="kt">bool</span><span class="p">,</span><span class="w"></span>
+<span class="p">}</span><span class="w"></span></pre>
+        </section>
+        <section id="references">
+            <h2>References</h2>
+            <table id="rfc2119" class="footnote">
+                <tbody>
+                    <tr>
+                        <th>1</th>
+                        <td><code>RFC 2119: Key words for use in RFCs to Indicate Requirement Levels &lt;https://www.rfc-editor.org/rfc/rfc2119.html&gt;</code></td>
+                    </tr>
+                </tbody>
+            </table>
+        </section>
+    </section>
+</body>
+</html>

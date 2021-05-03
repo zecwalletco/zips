@@ -1,4 +1,5 @@
 ::
+
   ZIP: xxxx
   Title: BlazeSync for zcash light clients.
   Owner: Aditya Kulkarni <aditya@zecwallet.co>
@@ -6,7 +7,6 @@
   Category: Light Clients
   Created: 2021-04-26
   License: MIT
-  Discussions-To: <>
 
 
 Terminology
@@ -18,11 +18,7 @@ are to be interpreted as described in RFC 2119. [#RFC2119]_
 
 Abstract
 ========
-
-The sync process for Lightclients today is not optimal. Lightclients today process `CompactBlock`s
-`CompactOutput`s and `CompactSpend`s one at a time which causes performance bottlenecks. BlazeSync
-attempts to solve this by decoupling the various parts of the sync process to allow many things
-to be parallelized, allowing the overall sync to move faster. 
+The sync process for Lightclients today is not optimal. Lightclients today process ``CompactBlock``\s, ``CompactOutput``\s and ``CompactSpend``\s one at a time which causes performance bottlenecks. BlazeSync attempts to solve this by decoupling the various parts of the sync process to allow many things to be parallelized, allowing the overall sync to move faster. 
 
 
 Motivation and Requirements
@@ -48,15 +44,15 @@ This sections describes the data structures and algorithms used in the sync.
 
 Wallet Transaction List (WTL)
 ------------------------------
-The Wallet Transaction List (WTL) data structure is data structure that holds the list of all transactions belonging to the wallet. It is represented in memory by the `WalletTransaction` struct (and it's dependent structs). It may be persisted to disk as well, either into flat files or into a SQLLite or similar data base. 
+The Wallet Transaction List (WTL) data structure is data structure that holds the list of all transactions belonging to the wallet. It is represented in memory by the ``WalletTransaction`` struct (and it's dependent structs). It may be persisted to disk as well, either into flat files or into a SQLLite or similar data base. 
 
 This data structure and its components can be incomplete when first created, because the transactions are scanned out of order and backwards. The code needs to be resilient enough to tolerate some data that is temporarily missing in the data structure and will be filled in later as the scan proceeds. 
 
-`WalletTransaction` are keyed by `TxID` of the transaction, and needs be indexable/lookup-able by `TxID`. We also will index the sapling nullifiers - i.e., we need to be able to lookup the `TxID` where a nullifier was created (created, not spent).
+``WalletTransaction`` are keyed by ``TxID`` of the transaction, and needs be indexable/lookup-able by ``TxID``. We also will index the sapling nullifiers - i.e., we need to be able to lookup the ``TxID`` where a nullifier was created (created, not spent).
 
 BlazeSync starts by syncing the latest block first and moving backwards. Blocks are requested from LightwalletD in 1000-block chunks, streamed in descending order of block height.  
 
-(FEATURE REQUEST: Allow blocks to be streamed in descending order of height in `GetBlockRange`)
+(FEATURE REQUEST: Allow blocks to be streamed in descending order of height in ``GetBlockRange``)
 
 For each block received from LightwalletD, we do the trial decryptions for all Spends and Outputs, over all the wallet's IVKs and OVKs. If it detects a Spend or Output, it adds the transaction into the Wallet Transaction List (WTL). During a sync, the Spend for a sapling note is likely to be encountered before the Output, so when inserting the data into the Wallet Transaction List(WTL), some data might be missing or partial.
 
@@ -66,10 +62,10 @@ Detecting Sapling Spends
 ------------------------
 
 A sapling spend is detected when either 
-1. The `CompactSpend.nullifier` matches a nullifier in that we already have in the wallet OR
-2. The `try_sapling_output_recovery` matches a `SaplingOutput` in the transaction when scanned with one of the wallet's OVKs. 
+1. The ``CompactSpend.nullifier`` matches a nullifier in that we already have in the wallet OR
+2. The ``try_sapling_output_recovery`` matches a ``SaplingOutput`` in the transaction when scanned with one of the wallet's OVKs. 
 
-(FEATURE REQUEST1: `librustzcash` might be missing a `try_sapling_compact_output_recovery` method. Attempt decryption of a `CompactOutput` with an OVK.)
+(FEATURE REQUEST1: ``librustzcash`` might be missing a ``try_sapling_compact_output_recovery`` method. Attempt decryption of a ``CompactOutput`` with an OVK.)
 
 It might be possible that the wallet doesn't actually have one of the nullifiers in such a transaction, for example, if a previous wallet had an imported private key, and the nullifier belonged to that. 
 The wallet should assume that all the nullifiers in this transaction belong to the wallet and have been spent here. 
@@ -78,8 +74,8 @@ The wallet should assume that all the nullifiers in this transaction belong to t
 Detecting Sapling Outputs
 --------------------------
 
-A sapling output is detected when the `try_sapling_compact_note_decryption` succeeds on a CompactOutput. In this case, the note is marked as received.
-The wallet might need to ask the LightwalletD for the sapling `CommitmentTree` to initialize this note's nullifier and start tracking the witness if the wallet doesn't already have it. In this case, the note should be marked "untrusted". It will flip to "trusted" when the `WalletBlock`'s `CommitmentTree` catches up to the block in which this note was received, and the tree received from LightwalletD is compared to the computed one, and then marked as trusted. Only trusted notes can be spent. 
+A sapling output is detected when the ``try_sapling_compact_note_decryption`` succeeds on a CompactOutput. In this case, the note is marked as received.
+The wallet might need to ask the LightwalletD for the sapling ``CommitmentTree`` to initialize this note's nullifier and start tracking the witness if the wallet doesn't already have it. In this case, the note should be marked "untrusted". It will flip to "trusted" when the ``WalletBlock``'s ``CommitmentTree`` catches up to the block in which this note was received, and the tree received from LightwalletD is compared to the computed one, and then marked as trusted. Only trusted notes can be spent. 
 
 ### Maintaining Note's witnesses
 When a new note is created during the sync, it's witness is fetched from LightwalletD, and marked untrusted. At this point, all the information needed to track the updates to the witness is available in the wallet, and the note's witness can start being updated, even though the sync is not complete yet. This allows the note to be ready to be spent sooner, especially benefiting recently received notes. 
@@ -98,10 +94,10 @@ Wallet Blocks
 The wallet blocks data structure holds a list of the blocks that are relevant to the wallet. The Wallet Blocks are updated in two passes. 
 
 Phase 1: As the blocks are received in reverse order from LightwalletD, the block number and block hash are stored. 
-When the sync reaches the wallet's previous `latest_synced_block` (or a checkpoint for a new wallet), the block's `CommitmentTree` is computed and stored alongside the hash and the height. 
+When the sync reaches the wallet's previous ``latest_synced_block`` (or a checkpoint for a new wallet), the block's ``CommitmentTree`` is computed and stored alongside the hash and the height. 
 Once all the blocks are downloaded, all the unspent nullifiers' witnesses' can start to be updated. 
 
-Phase 2: The `CommitmentTree` for each block is computed forward direction, until it reaches the latest block
+Phase 2: The ``CommitmentTree`` for each block is computed forward direction, until it reaches the latest block
 As the forwards sync reaches an active and untrusted Sapling note (i.e., a Sapling note in the wallet that has not been spent and has not been marked trusted), the CommitmentTree that was computed is compared to what was fetched for the Sapling note. The trees should match, upon which the Note is marked as trusted, and ready to be spent. 
 
 Fetching Memos
@@ -110,15 +106,186 @@ The memo for a Sapling Note can be fetched as soon as we detect it was received.
 
 Detecting Reorgs
 -----------------
-As the sync proceeds backwards, it will eventually hit the wallet's `last_synced_height`. If the height and hash of the block matches, then there is no reorg. If it doesn't, the wallet's block at `last_synced_height` was reorged, and needs to be "popped". 
+As the sync proceeds backwards, it will eventually hit the wallet's ``last_synced_height``. If the height and hash of the block matches, then there is no reorg. If it doesn't, the wallet's block at ``last_synced_height`` was reorged, and needs to be "popped". 
 
 'Popping' Blocks
 -----------------
 When a block has been reorg'd, we need to undo all the effects of adding the block into the wallet. This means:
 1. Popping the last witness update to each of the wallet's active note's witness
-2. Removing all `txid` from Wallet Transaction List (WTL) that were created at the height
+2. Removing all ``txid`` from Wallet Transaction List (WTL) that were created at the height
 3. Remove all spends for notes & Utxo's that were popped in step 2 from all other transactions
 4. If a transaction that was popped in step 2 was a spend transaction who's anchor was a the block, we need to notify the user that one of the recent transactions that she sent will no longer be mined. 
-5. Remove the block at the height from the `WalletBlocks` data structure. 
+5. Remove the block at the height from the ``WalletBlocks`` data structure. 
 
 Note that there is a 100-block reorg limit. 
+
+Data structures
+================
+.. code-block:: rust
+
+  use zcash_primitives::{memo::Memo, merkle_tree::{CommitmentTree, IncrementalWitness}, sapling::{Node, Note}};
+
+
+  // Represents a single transaction that belongs to the wallet. This data structure can be held in memory
+  // and persisted to disk, even into a SQL database. BlazeSync relies on being able to lookup `WalletTransaction` by 
+  // a TxID, SQL schemas should also index by it. (Or hold it in memory as a map)
+  struct WalletTransaction {
+      // The TxID of this transaction. 
+      txid: [u8; 32], 
+
+      // The block number and hash where this TxID was mined. This will be `None` if this Tx has not been mined yet.
+      block: Option<BlockID>,
+
+      // List of transparent UTXOs that were spent in this Transaction. Note that this is a list
+      // of UtxoIDs, not the UTXOs themselves, since the wallet is likely to encounter spends before the receives (See
+      // Note below))
+      spent_utxos: Vec<UtxoID>,
+
+      // List of UTXOs that were received in this transaction. The whole Utxo (not just the ID) is stored here. We
+      // also need to be able to index into this. 
+      received_utxos: Vec<Utxo>,
+
+      // List of Sapling nullifiers spent in this Transaction. All sapling notes are indexed by their nullifiers
+      // (similar to `UtxoID` or `BlockID`)
+      spent_sapling_notes: Vec<SaplingNoteID>,
+
+      // List of outgoing sapling sends contained in this transaction. 
+      outgoing_metadata: Vec<OutgoingMetadata>,
+
+      // List of sapling notes received in this Transaction. We store the whole Sapling note here.
+      received_sapling_notes: Vec<SaplingNote>,
+
+      // A quick note on the use of `UtxoID` and nullifiers to identify transparent Utxos and sapling notes:
+      // Since the wallet scans backwards, we are likely to see the spending of a Utxo or a sapling note first, and then 
+      // eventually reach the Transaction where the Utxos and Sapling notes were created. That is, while a scan
+      // is in progress, the data might not be fully available yet, so we use IDs rather than Rust pointers everywhere. 
+      // Of course, this means that the code needs to be careful to make sure everything lines up once the sync is 
+      // complete - i.e., All `UtxoID`, `BlockID` and nullifiers are valid. 
+  }
+
+  // A struct that is useful to lookup Sapling notes. Mainly used to keep track of
+  // spent sapling notes, which are usually seen before the receive, so we may, at times, 
+  // have partial information
+  struct SaplingNoteID {
+      // The nullifier, if available
+      nullifier: Option<[u8; 32]>,
+
+      // The value that was spent, which is the value of the note that was spent. 
+      value: u64,
+
+      // The TxID in which this Sapling note was created
+      created_txid: Option<[u8; 32]>,
+  }
+
+  // Struct representing information recovered from an outgoing sapling transaction, which is 
+  // recovered using the OVK. Has metadata about a payment sent to a sapling address.
+  struct OutgoingMetadata {
+      // The address to which this TX was sent
+      address: String,
+
+      // Amount that was sent
+      value: u64,
+
+      // Memo that we sent to the address
+      memo: Option<Memo>,
+  }
+
+  // The details of a sapling note that belongs to the wallet.
+  struct SaplingNote {
+      // The nullifier of this note.
+      nullifier: [u8; 32],
+
+      // The details of the note (value, rseed, g_d, pk_d)
+      note: Note,
+
+      // The memo for this Note. This is optional, because the wallet may not have fetched it yet, 
+      // or the user has disabled fetching memos
+      memo: Option<Memo>,
+
+      // The wallet z-address that this note belongs to
+      wallet_key: String,
+
+      // The witness for this note, used while spending it. Note that this `Vec` might be empty,
+      // if we don't have the spending key (we only have the viewing key) of this address. 
+      witness: Vec<IncrementalWitness<Node>>,
+
+      // The TxID where this Sapling note was _created_
+      txid: [u8; 32],
+
+      // The block where this Sapling note was _created_
+      block: BlockID,
+
+      // The position where this note was created. That is, the output number of the TxID where this note was
+      // created. We need this because the witness for this note is created at this position. The 
+      // `(block id, txid and position)` together identify where to start updating the witness for this note from.
+      note_position: u32,
+
+      // The TxID of the transaction where this was spent. Note that this TxID will need to correspond to 
+      // a `WalletTransaction`, so we can connect it to where it was spent. A Note that has been spent
+      // doesn't need to have its `witness` tracked anymore, so the `witness` should become vec![].
+      spent_txid: Option<[u8; 32]>,
+
+      // If this note was created automatically by the wallet as "change". Determining this is a bit of guesswork,
+      // since the protocol doesn't have a concept of "change", but useful when displaying transactions
+      // in the wallet. 
+      is_change: bool,
+  }
+
+  // A simple structure to identify a Utxo in the wallet. It essentially points to a Utxo. 
+  struct UtxoID {
+      // The TxID where this UTXO was _created_
+      txid: [u8; 32],
+
+      // The output_index of this Utxo
+      output_index: u32,
+  }
+
+  // A way to identify blocks across the wallet. We store both the height and the hash, making it easier to deal
+  // with rollbacks
+  struct BlockID {
+      // Hash of the block
+      hash: [u8; 32],
+
+      // Block height
+      height: u32,
+
+      // The state of the sapling tree at the end of the block. 
+      tree: CommitmentTree<Node>,
+  }
+
+  // A simple data structure identifying a UTXO in the wallet. 
+  struct Utxo {
+      // The TxID where this UTXO was _created_
+      txid: [u8; 32],
+
+      // The block where this UTXO was _created_
+      block: BlockID,
+
+      // The output_index of this Utxo
+      output_index: u32,
+
+      // Amount (in zats) held in this UTXO
+      value: u64,
+
+      // The TxID of the transaction where this was spent. Note that this TxID will need to correspond to 
+      // a `WalletTransaction`, so we can connect it to where it was spent. 
+      spent_txid: Option<[u8; 32]>,
+
+      // The actual stript of the Utxo
+      script: Vec<u8>,
+
+      // The t-address of this Utxo. Note that this address may not belong to the wallet,
+      // and even if it did, we may not have the private key of this address.
+      address: String,
+
+      // If this Utxo was created automatically by the wallet as "change". Determining this is a bit of guesswork,
+      // since the protocol doesn't have a concept of "change", but useful when displaying transactions
+      // in the wallet. 
+      is_change: bool,
+  }
+
+
+References
+==========
+
+.. [#RFC2119] ``RFC 2119: Key words for use in RFCs to Indicate Requirement Levels <https://www.rfc-editor.org/rfc/rfc2119.html>``
