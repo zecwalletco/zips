@@ -77,7 +77,9 @@ Detecting Sapling Outputs
 A sapling output is detected when the ``try_sapling_compact_note_decryption`` succeeds on a CompactOutput. In this case, the note is marked as received.
 The wallet might need to ask the LightwalletD for the sapling ``CommitmentTree`` to initialize this note's nullifier and start tracking the witness if the wallet doesn't already have it. In this case, the note should be marked "untrusted". It will flip to "trusted" when the ``WalletBlock``'s ``CommitmentTree`` catches up to the block in which this note was received, and the tree received from LightwalletD is compared to the computed one, and then marked as trusted. Only trusted notes can be spent. 
 
-### Maintaining Note's witnesses
+Maintaining Note's witnesses
+----------------------------
+
 When a new note is created during the sync, it's witness is fetched from LightwalletD, and marked untrusted. At this point, all the information needed to track the updates to the witness is available in the wallet, and the note's witness can start being updated, even though the sync is not complete yet. This allows the note to be ready to be spent sooner, especially benefiting recently received notes. 
 
 For notes that are already in the wallet, the witness can start to be updated once all the blocks are received from LightwalletD.
@@ -111,6 +113,7 @@ As the sync proceeds backwards, it will eventually hit the wallet's ``last_synce
 'Popping' Blocks
 -----------------
 When a block has been reorg'd, we need to undo all the effects of adding the block into the wallet. This means:
+
 1. Popping the last witness update to each of the wallet's active note's witness
 2. Removing all ``txid`` from Wallet Transaction List (WTL) that were created at the height
 3. Remove all spends for notes & Utxo's that were popped in step 2 from all other transactions
@@ -119,12 +122,16 @@ When a block has been reorg'd, we need to undo all the effects of adding the blo
 
 Note that there is a 100-block reorg limit. 
 
+New Wallets
+-----------
+When new wallets are created, they don't have any existing transactions, so there's no need to do the trial decryptions when initializing the wallet from the last checkpoint. Therefore, new wallets should just do the node sync from the last checkpoint, and mark the wallet as synced and ready as soon as the node sync finishes. 
+
+
 Data structures
 ================
 .. code-block:: rust
 
   use zcash_primitives::{memo::Memo, merkle_tree::{CommitmentTree, IncrementalWitness}, sapling::{Node, Note}};
-
 
   // Represents a single transaction that belongs to the wallet. This data structure can be held in memory
   // and persisted to disk, even into a SQL database. BlazeSync relies on being able to lookup `WalletTransaction` by 
